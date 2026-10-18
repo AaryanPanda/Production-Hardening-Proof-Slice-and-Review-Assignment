@@ -1,57 +1,78 @@
-# Starter — Circuit Breaker Proof Slice (PromptPilot)
+# Circuit Breaker Proof Slice — PromptPilot
 
-This is the starter repository for **Option B (provided scenario)** of the assignment.
+**Option B (provided scenario).** One production-safety control — a **circuit breaker** around
+PromptPilot's external model provider — implemented, tested, and observable.
 
-Repository: `https://github.com/kalviumcommunity/Production-Hardening-Proof-Slice-and-Review-Assignment` (public, owned by
-`kalviumcommunity`). Fork it, implement the breaker, and open a pull request back to your fork.
+## Proof-slice answers
 
-> The control here is a **circuit breaker**, covered earlier in this module. You are applying a
-> concept you have already learned, not a new one.
+1. **Risk** — When the model provider is slow or failing, every reply request keeps calling it, so
+   doomed calls pile up, exhaust connections/threads, and the failure spreads across PromptPilot.
 
-## Scenario
+2. **Control** — A circuit breaker in [`src/circuitBreaker.js`](./src/circuitBreaker.js), wired into
+   the reply path in [`src/replyService.js`](./src/replyService.js). It trips `OPEN` on a sustained
+   failure rate, short-circuits to a safe fallback, and probes once (`HALF_OPEN`) to recover.
 
-PromptPilot drafts support replies by calling an external model provider. When the provider is slow
-or failing, every request still tries it, so doomed calls pile up and the failure spreads. You will
-add a **circuit breaker** so sustained failures short-circuit fast to a safe fallback, then recover
-through a probe.
+3. **Run / test** — `node --test` (Node 18+). **Expected:** `# pass 8` / `# fail 0` — all 8 tests
+   pass.
 
-## Your task
+4. **Evidence** — [`test/circuitBreaker.test.js`](./test/circuitBreaker.test.js) proves the state
+   machine (closed under low volume → opens on threshold → short-circuits without calling the
+   dependency → probes and closes on success → re-opens on a failed probe → emits the
+   `OPEN → HALF_OPEN → CLOSED` transitions). [`test/replyService.test.js`](./test/replyService.test.js)
+   proves the reply path returns a model draft while healthy and a safe fallback once the circuit
+   opens. A reviewer confirms it with one command: `node --test`.
 
-Implement the circuit breaker in [`src/circuitBreaker.js`](./src/circuitBreaker.js). The file has a
-skeleton and a `TODO`. The behaviour is fully specified by the supplied tests.
+5. **Observability** — Two signals. **Metric:** `metrics.breaker_open_total` increments on every
+   trip and `metrics.short_circuited_total` on every fast-fail. **Log:** on each state change the
+   reply service emits a structured line, e.g.
+   `{"level":"warn","component":"circuit_breaker","event":"breaker_state_change","state":"OPEN","breaker_open_total":1,...}`.
+   The line carries only the control's state and counters — **never the ticket, provider reply,
+   secrets, tokens, or personal data.**
 
-Prerequisite: Node.js 18 or newer (the tests use Node's built-in test runner). Then run:
+6. **Trade-off** — While `OPEN`, healthy requests are also refused (served the fallback) for up to
+   `openMillis`, and a single `HALF_OPEN` probe can still fail a real user. The breaker trades a
+   small amount of availability-to-the-provider for protection of the whole service.
 
-```bash
-node --test
+7. **Remaining risk** — It guards one dependency with a simple count-ratio window (no rolling
+   time-window, no per-endpoint breakers, no bulkheads/retries). It does not fix the provider, does
+   not cover partial/slow-but-successful responses, and shared in-process state is per-instance only.
+
+8. **Design link (Modules 1–3)** — This protects the earlier decision to draft replies via an
+   **external provider on the synchronous request path**. The breaker keeps that dependency from
+   turning a provider outage into a PromptPilot outage, preserving the "degrade to a human-agent
+   fallback" contract that design assumed.
+
+## How the breaker behaves
+
+```
+CLOSED ──(failures/calls ≥ threshold AND calls ≥ minimumRequests)──▶ OPEN
+  ▲                                                                   │
+  │ probe succeeds                                 openMillis elapsed │
+  └──────────────── HALF_OPEN ◀───────────────────────────────────────┘
+                       │ probe fails ──▶ OPEN
 ```
 
-Make **all tests pass**. Do **not** modify the tests. The reply path in `src/replyService.js` is
-already wired to your breaker.
+- **CLOSED** — calls pass through; calls and failures are counted.
+- **OPEN** — within `openMillis`, calls short-circuit with `CircuitOpenError` (the dependency is
+  never called) and `short_circuited_total` increments.
+- **HALF_OPEN** — after `openMillis`, one probe is allowed: success closes the breaker and resets the
+  counts; failure re-opens it and increments `breaker_open_total`.
 
-The breaker must:
+Tunable via options: `failureThreshold`, `minimumRequests`, `openMillis`, `now` (injectable clock),
+`onStateChange`.
 
-- start `CLOSED` and count calls and failures;
-- move to `OPEN` when `failures / calls >= failureThreshold` **and** `calls >= minimumRequests`;
-- while `OPEN` and within `openMillis`, short-circuit (throw `CircuitOpenError` without calling the
-  dependency) and increment `metrics.short_circuited_total`;
-- after `openMillis` elapses (using the injected `now()`), allow one `HALF_OPEN` probe — success
-  closes it and resets counts, failure re-opens it;
-- increment `metrics.breaker_open_total` on every trip and call `onStateChange(state)` on every
-  transition.
+## Test output
 
-## What to submit
-
-Open a pull request on a branch named `production-hardening-slice`, and in your README include these
-labelled sections:
-
-1. **Risk addressed**
-2. **Chosen control**
-3. **How to run / test**
-4. **Evidence** (a reviewer can confirm it works without reading all your code)
-5. **Observability note** (which metric moves and which state changes are logged)
-6. **Trade-off**
-7. **Remaining risk**
-8. **How this production control protects my Modules 1–3 design**
-
-Submit the pull-request URL.
+```text
+ok 1 - stays closed below the minimum request volume
+ok 2 - opens once failures cross the threshold with enough volume
+ok 3 - short-circuits without calling the dependency while open
+ok 4 - probes after the open window and closes on a successful probe
+ok 5 - a failed probe re-opens the circuit
+ok 6 - reports state changes for observability
+ok 7 - returns a model draft while the provider is healthy
+ok 8 - degrades to a safe fallback once the circuit opens
+# tests 8
+# pass 8
+# fail 0
+```
